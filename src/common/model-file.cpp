@@ -11,6 +11,7 @@
 #include <stdexcept>
 
 #include "error.h"
+#include "file-map.h"
 #include "json.h"
 #include "log.h"
 
@@ -151,15 +152,13 @@ ModelFile::ModelFile(const std::string & path, ggml_backend_t backend, const Lay
                      const std::function<bool(const std::string & name)> & keep)
     : path_(path), architecture_(layout.architecture), remedy_(layout.remedy) {
     open(layout);
-    allocate([&](const std::string & name) { return !keep || keep(name) ? backend : nullptr; });
-    load();
+    load(allocate([&](const std::string & name) { return !keep || keep(name) ? backend : nullptr; }, true));
 }
 
 ModelFile::ModelFile(const std::string & path, const Layout & layout, const std::function<ggml_backend_t(const std::string & name)> & place)
     : path_(path), architecture_(layout.architecture), remedy_(layout.remedy) {
     open(layout);
-    allocate(place);
-    load();
+    load(allocate(place, true));
 }
 
 ModelFile::ModelFile(const std::string & path, const Layout & layout)
@@ -170,7 +169,7 @@ ModelFile::ModelFile(const std::string & path, const Layout & layout)
 ModelFile::ModelFile(const ModelFile & source, ggml_backend_t backend, const std::function<bool(const std::string & name)> & keep)
     : path_(source.path_), architecture_(source.architecture_), remedy_(source.remedy_), version_(source.version_), gguf_(source.gguf_),
       ctx_(source.ctx_) {
-    allocate([&](const std::string & name) { return (!keep || keep(name)) && source.by_name_.count(name) ? backend : nullptr; });
+    allocate([&](const std::string & name) { return (!keep || keep(name)) && source.by_name_.count(name) ? backend : nullptr; }, false);
     for (const auto & [name, t] : by_name_) ggml_backend_tensor_copy(source.tensor(name), t);
 }
 
@@ -236,9 +235,11 @@ void ModelFile::check_tensors(const Layout & layout) const {
     }
 }
 
-void ModelFile::allocate(const std::function<ggml_backend_t(const std::string & name)> & place) {
+ModelFile::Placed ModelFile::allocate(const std::function<ggml_backend_t(const std::string & name)> & place, bool map) {
     const int64_t n = gguf_get_n_tensors(gguf_.get());
+    const uint64_t data_offset = gguf_get_data_offset(gguf_.get());
     std::vector<ggml_backend_t> backends;
+    std::vector<Placed> placed;
     for (int64_t i = 0; i < n; i++) {
         const char * name = gguf_get_tensor_name(gguf_.get(), i);
         ggml_backend_t backend = place(name);
@@ -249,30 +250,67 @@ void ModelFile::allocate(const std::function<ggml_backend_t(const std::string & 
             kept_.emplace_back(ggml_init(params), ggml_free);
             if (!kept_.back()) throw Error(Fault::OutOfMemory, "cannot create a ggml context for the tensors of " + path_);
             backends.push_back(backend);
+            placed.emplace_back();
         }
         ggml_tensor * t = ggml_dup_tensor(kept_[at].get(), ggml_get_tensor(ctx_.get(), name));
         ggml_set_name(t, name);
         by_name_.emplace(name, t);
+        placed[at].emplace_back(t, data_offset + gguf_get_tensor_offset(gguf_.get(), i));
     }
+    Placed unread;
     for (size_t i = 0; i < backends.size(); i++) {
-        buffers_.emplace_back(ggml_backend_alloc_ctx_tensors(kept_[i].get(), backends[i]), ggml_backend_buffer_free);
-        if (!buffers_.back()) throw Error(Fault::OutOfMemory, "cannot allocate the weights of " + path_ + " on " + ggml_backend_name(backends[i]));
-        ggml_backend_buffer_set_usage(buffers_.back().get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_dev_t device = ggml_backend_get_device(backends[i]);
+        ggml_backend_dev_props props = {};
+        ggml_backend_dev_get_props(device, &props);
+        if (!map || !props.caps.buffer_from_host_ptr) {
+            buffers_.emplace_back(ggml_backend_alloc_ctx_tensors(kept_[i].get(), backends[i]), ggml_backend_buffer_free);
+            if (!buffers_.back()) throw Error(Fault::OutOfMemory, "cannot allocate the weights of " + path_ + " on " + ggml_backend_name(backends[i]));
+            ggml_backend_buffer_set_usage(buffers_.back().get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            unread.insert(unread.end(), placed[i].begin(), placed[i].end());
+            continue;
+        }
+        if (!map_) map_ = std::make_unique<FileMap>(path_);
+        Placed & tensors = placed[i];
+        std::sort(tensors.begin(), tensors.end(), [](const auto & a, const auto & b) { return a.second < b.second; });
+        // One buffer for each run of the device's tensors that lie next to each other in the file, apart by the
+        // padding to the file's alignment at most: Metal counts every byte a buffer covers as memory in use, so a
+        // buffer that spanned another device's tensors, a model's experts kept on the CPU among them, would take their
+        // size from the GPU's.
+        const uint64_t alignment = gguf_get_alignment(gguf_.get());
+        for (size_t begin = 0; begin < tensors.size();) {
+            uint64_t end = tensors[begin].second;
+            size_t largest = 0, past = begin;
+            for (; past < tensors.size() && (past == begin || tensors[past].second < end + alignment); past++) {
+                end = std::max(end, tensors[past].second + ggml_nbytes(tensors[past].first));
+                largest = std::max(largest, ggml_nbytes(tensors[past].first));
+            }
+            if (end > map_->size()) throw file_error("cannot read the tensors of " + path_ + "; the file is shorter than its header says");
+            // Metal maps whole pages, and the CPU takes a buffer that starts aligned, so a buffer starts on a page.
+            const uint64_t first = tensors[begin].second - tensors[begin].second % map_->page();
+            buffers_.emplace_back(ggml_backend_dev_buffer_from_host_ptr(device, map_->bytes() + first, (size_t) (end - first), largest),
+                                  ggml_backend_buffer_free);
+            if (!buffers_.back()) throw Error(Fault::OutOfMemory, "cannot map the weights of " + path_ + " for " + ggml_backend_name(backends[i]));
+            ggml_backend_buffer_set_usage(buffers_.back().get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            for (size_t k = begin; k < past; k++) {
+                if (ggml_backend_tensor_alloc(buffers_.back().get(), tensors[k].first, map_->bytes() + tensors[k].second) != GGML_STATUS_SUCCESS) {
+                    throw Error(Fault::Device, std::string("cannot place the tensor ") + ggml_get_name(tensors[k].first) + " of " + path_ + " on " +
+                                                   ggml_backend_name(backends[i]));
+                }
+            }
+            begin = past;
+        }
     }
+    return unread;
 }
 
-void ModelFile::load() {
+void ModelFile::load(const Placed & tensors) {
+    if (tensors.empty()) return;
     std::unique_ptr<FILE, decltype(&std::fclose)> f(ggml_fopen(path_.c_str(), "rb"), &std::fclose);
     if (!f) throw Error(Fault::Io, "cannot open " + path_);
-    const uint64_t data_offset = gguf_get_data_offset(gguf_.get());
     std::vector<uint8_t> piece;
-    for (int64_t i = 0; i < gguf_get_n_tensors(gguf_.get()); i++) {
-        const char * name = gguf_get_tensor_name(gguf_.get(), i);
-        const auto it = by_name_.find(name);
-        if (it == by_name_.end()) continue;
-        ggml_tensor * t = it->second;
+    for (const auto & [t, at] : tensors) {
         const size_t size = ggml_nbytes(t);
-        bool read = seek_file(f.get(), data_offset + gguf_get_tensor_offset(gguf_.get(), i));
+        bool read = seek_file(f.get(), at);
         for (size_t done = 0; read && done < size;) {
             const size_t n = std::min(kReadPiece, size - done);
             piece.resize(std::max(piece.size(), n));
@@ -280,7 +318,7 @@ void ModelFile::load() {
             if (read) ggml_backend_tensor_set(t, piece.data(), done, n);
             done += n;
         }
-        if (!read) throw file_error(std::string("cannot read the tensor ") + name + " of " + path_ + "; the file is shorter than its header says");
+        if (!read) throw file_error(std::string("cannot read the tensor ") + ggml_get_name(t) + " of " + path_ + "; the file is shorter than its header says");
     }
 }
 

@@ -36,6 +36,7 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 add_library(speechcommon STATIC
+    src/common/file-map.cpp
     src/common/model-file.cpp
     src/common/storage.cpp
     src/common/quantize.cpp

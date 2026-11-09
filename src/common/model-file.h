@@ -9,9 +9,11 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "ggml-backend.h"
+#include "file-map.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "storage.h"
@@ -56,6 +58,11 @@ std::string gguf_architecture(const std::string & path);
  * for, live in a backend buffer, or in one buffer for each backend a reader places them on. A key is read by its exact type: one that is missing or of another type throws
  * with a message naming it, where ggml's own getters would abort the process. Every failure throws an Error: Io for
  * a file that cannot be opened or read, File for one whose content this release cannot use.
+ *
+ * A backend whose device takes a host pointer, the CPU and Metal, holds its tensors in the file's pages, mapped
+ * read-only, rather than in a copy: the system reads them from the file as they are used and may drop them and read
+ * them again, so they are not the process's own memory. A device that takes none, Vulkan's, holds a copy read from
+ * the file. The file must stay as it is while the model is loaded.
  */
 class ModelFile {
 public:
@@ -164,10 +171,16 @@ private:
     /** "layout 1 of qwen3-tts", or the architecture alone while the layout is not yet read. */
     std::string layout_name() const;
     void check_tensors(const Layout & layout) const;
-    /** Allocates each tensor on the backend `place` gives its name, or none where it gives null, without its values. */
-    void allocate(const std::function<ggml_backend_t(const std::string & name)> & place);
-    /** Reads the values of the allocated tensors from the file. */
-    void load();
+    /** Tensors, each with the offset from the file's start of its values. */
+    using Placed = std::vector<std::pair<ggml_tensor *, uint64_t>>;
+    /**
+     * Allocates each tensor on the backend `place` gives its name, or none where it gives null. Given `map`, a backend
+     * whose device takes a host pointer holds its tensors in the file's mapped pages, with their values. Returns the
+     * other tensors, which get memory without their values.
+     */
+    Placed allocate(const std::function<ggml_backend_t(const std::string & name)> & place, bool map);
+    /** Reads the values of `tensors` from the file. */
+    void load(const Placed & tensors);
 
     std::string path_, architecture_, remedy_;
     uint32_t version_ = 0;
@@ -182,7 +195,9 @@ private:
      * Qwen3-ASR decoder, 308 lookups, took 0.36 ms with it and takes 0.12 ms here, of a step of 7.5 ms (2026-10-07).
      */
     std::unordered_map<std::string, ggml_tensor *> by_name_;
-    /** The buffers of the loaded tensors, one for each context of kept_. */
+    /** The file mapped read-only, while a buffer of buffers_ holds tensors in its pages; declared first, freed last. */
+    std::unique_ptr<FileMap> map_;
+    /** The buffers of the loaded tensors: one for each context of kept_ that holds a copy, one for each run of mapped tensors. */
     std::vector<std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)>> buffers_;
 };
 
